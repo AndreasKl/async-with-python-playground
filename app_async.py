@@ -8,10 +8,10 @@ Three endpoints simulating a 100 ms IO call (database query, HTTP request, ...):
                       in its own ThreadSensitiveContext, so every in-flight
                       request gets its own thread: blocking is absorbed.
 
-Run (mirrors prod config):
+Run (mirrors prod config, incl. the custom worker from worker.py):
     uv run gunicorn app_async:app \
         --workers=3 \
-        --worker-class uvicorn_worker.UvicornWorker \
+        --worker-class worker.UvicornWorker \
         --timeout 120 \
         --bind 0.0.0.0:8001 \
         --preload \
@@ -19,6 +19,7 @@ Run (mirrors prod config):
 """
 
 import asyncio
+import os
 import time
 
 from django.conf import settings
@@ -68,4 +69,32 @@ urlpatterns = [
 # Imported lazily so settings.configure() above runs first.
 from django.core.asgi import get_asgi_application  # noqa: E402
 
+
+class MaxConcurrencyMiddleware:
+    """Bound in-flight requests per worker with a semaphore.
+
+    Requests above the cap wait in the (async, cheap) queue instead of each
+    spawning an OS thread - the same bounded-pool semantics as gunicorn's
+    gthread worker, but for ASGI. Alternative: uvicorn's limit_concurrency
+    (see worker.py), which sheds excess requests with 503 instead of queuing.
+    """
+
+    def __init__(self, app, limit: int) -> None:
+        self.app = app
+        self.semaphore = asyncio.Semaphore(limit)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        async with self.semaphore:
+            await self.app(scope, receive, send)
+
+
 app = get_asgi_application()
+
+# 0 = unbounded (Django's default behavior). The bench sets this to show the
+# bound in action; in prod pick a cap sized like a gthread pool would be.
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "0"))
+if MAX_CONCURRENT_REQUESTS:
+    app = MaxConcurrencyMiddleware(app, MAX_CONCURRENT_REQUESTS)

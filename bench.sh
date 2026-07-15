@@ -11,12 +11,18 @@
 #   3. UvicornWorker, SYNC view,  time.sleep(0.1)    -> ~400 req/s
 #      (Django runs each request in its own ThreadSensitiveContext:
 #       one thread per in-flight request absorbs the blocking call)
-#   4. sync worker,   sync view,  time.sleep(0.1)    -> ~30 req/s
+#   4. UvicornWorker, SYNC view, bounded to 3x5 slots -> ~150 req/s
+#      (MaxConcurrencyMiddleware semaphore: requests above the cap queue
+#       on the loop instead of spawning threads - gthread semantics on ASGI)
+#   5. sync worker,   sync view,  time.sleep(0.1)    -> ~30 req/s
+#   6. gthread worker (3x20 threads), sync view      -> ~450 req/s
+#      (fixed thread pool: 60 slots, bounded and predictable)
 #
 # Conclusion: blocking IO inside an ASYNC view (1) freezes the event loop and
 # performs no better than plain sync workers (4). A plain sync view (3) is
-# safe under ASGI because Django gives it a thread per request. Only truly
-# non-blocking IO (2) or sync views (3) deliver concurrency on ASGI.
+# safe under ASGI because Django gives it a thread per request - and gthread
+# workers (5) achieve the same with a BOUNDED pool. Only truly non-blocking
+# IO (2) or threaded sync views (3, 5) deliver concurrency.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -27,6 +33,9 @@ WRK_THREADS=4
 
 ASGI_PORT=8001
 WSGI_PORT=8002
+GTHREAD_PORT=8003
+GTHREAD_THREADS=20
+ASGI_BOUND=5  # deliberately tight (3x5=15 slots < 50 conns) to show queuing
 
 declare -a NAMES RESULTS
 
@@ -60,7 +69,7 @@ echo ">>> Starting gunicorn with Uvicorn workers (port $ASGI_PORT)"
 echo "    3 workers, each a single event loop - access log in asgi.log"
 uv run gunicorn app_async:app \
     --workers=3 \
-    --worker-class uvicorn_worker.UvicornWorker \
+    --worker-class worker.UvicornWorker \
     --timeout 120 \
     --bind "127.0.0.1:$ASGI_PORT" \
     --preload \
@@ -77,6 +86,25 @@ bench "ASGI + SYNC view + BLOCKING IO (thread per request)" \
 
 kill $ASGI_PID
 wait $ASGI_PID 2> /dev/null || true
+
+echo
+echo ">>> Restarting ASGI server with MAX_CONCURRENT_REQUESTS=$ASGI_BOUND"
+echo "    semaphore middleware bounds in-flight requests (and thus threads)"
+MAX_CONCURRENT_REQUESTS=$ASGI_BOUND uv run gunicorn app_async:app \
+    --workers=3 \
+    --worker-class worker.UvicornWorker \
+    --timeout 120 \
+    --bind "127.0.0.1:$ASGI_PORT" \
+    --preload \
+    --access-logfile '-' > asgi-bounded.log 2>&1 &
+ASGI_BOUNDED_PID=$!
+wait_ready "http://127.0.0.1:$ASGI_PORT/non-blocking"
+
+bench "ASGI + SYNC view + BLOCKING IO (bounded, 3x$ASGI_BOUND slots)" \
+    "http://127.0.0.1:$ASGI_PORT/blocking-sync-view"
+
+kill $ASGI_BOUNDED_PID
+wait $ASGI_BOUNDED_PID 2> /dev/null || true
 
 echo
 echo ">>> Starting gunicorn with sync workers (port $WSGI_PORT)"
@@ -97,6 +125,26 @@ kill $WSGI_PID
 wait $WSGI_PID 2> /dev/null || true
 
 echo
+echo ">>> Starting gunicorn with gthread workers (port $GTHREAD_PORT)"
+echo "    3 workers x $GTHREAD_THREADS threads - access log in gthread.log"
+uv run gunicorn app_sync:app \
+    --workers=3 \
+    --worker-class gthread \
+    --threads "$GTHREAD_THREADS" \
+    --timeout 120 \
+    --bind "127.0.0.1:$GTHREAD_PORT" \
+    --preload \
+    --access-logfile '-' > gthread.log 2>&1 &
+GTHREAD_PID=$!
+wait_ready "http://127.0.0.1:$GTHREAD_PORT/blocking"
+
+bench "WSGI + sync view + BLOCKING IO (gthread 3x$GTHREAD_THREADS threads)" \
+    "http://127.0.0.1:$GTHREAD_PORT/blocking"
+
+kill $GTHREAD_PID
+wait $GTHREAD_PID 2> /dev/null || true
+
+echo
 echo "==================== SUMMARY ===================="
 for i in "${!NAMES[@]}"; do
     printf "%-58s %10s req/s\n" "${NAMES[$i]}" "${RESULTS[$i]}"
@@ -106,6 +154,7 @@ echo "Every request 'waits on IO' for 100 ms. A blocking call inside an"
 echo "ASYNC view freezes the whole event loop: 3 uvicorn workers degrade"
 echo "to serial execution, no better than 3 plain sync workers. The same"
 echo "blocking call in a plain SYNC view is fine - Django gives each"
-echo "request its own thread under ASGI. On ASGI, either await real async"
+echo "request its own (unbounded) thread under ASGI, and gthread workers"
+echo "match that with a fixed, predictable pool. Either await real async"
 echo "IO or keep views sync; blocking inside 'async def' is the one fatal"
 echo "combination."
